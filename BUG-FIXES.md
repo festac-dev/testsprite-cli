@@ -184,3 +184,52 @@ suite executes by default, including all 6 EACCES-mapping tests and the 2
 Windows-path tests. The arithmetic checks out: 4,580 (baseline passing) + 2
 (converted bundle tests) + 6 (mode-bit tests now running under dropped
 capabilities) = 4,588.
+
+## 2026-10-16 (follow-up) — `billing-refusal-render.subprocess.test.ts` timed out under a loaded machine
+
+### Symptom
+
+`npm run test` reported **1 failed test file** (out of 115):
+
+```
+FAIL test/billing-refusal-render.subprocess.test.ts > billing refusal
+rendering in the built CLI > rollout text and JSON
+Error: Test timed out in 5000ms.
+```
+
+The full run had taken ~960s (a heavily contended machine). The same file
+passed when run alone, and its per-spawn `spawnSync` timeout of 10s never
+fired — only vitest's per-test timeout did.
+
+### Root cause
+
+Not a product bug. Each `it.each` case spawns the built CLI **twice** (text
+mode + `--output json`), and every spawn is allowed up to its own 10s
+`spawnSync` timeout — up to ~20s of legitimate runtime per case. But the
+vitest-level per-test timeout was left at the **5s default**, so any case
+whose two subprocess runs together took longer than 5s — easily possible on
+a loaded machine, where the suite itself runs 5× slower — was killed as a
+timeout even though both child processes were behaving normally.
+
+Reproduced the mechanism by adding CPU contention (32 busy-loops on a 4-core
+box): the file's aggregate test time went from 2.4s (uncontended) → 30.7s,
+with **4 of the 6 cases failing with the exact `Test timed out in 5000ms`
+signature** from the report.
+
+### Fix
+
+Set an explicit per-test timeout of **30s** on the `it.each` cases
+(`perTestTimeout`), matching the repo's existing convention for
+subprocess suites — `test/cli.subprocess.test.ts` already declares explicit
+30–60s timeouts on its tests. 30s covers the ~20s worst case (two spawns at
+their full 10s `spawnSync` timeout each) with headroom. No test logic
+changed. The two sibling subprocess suites —
+`test/tunnel-limit-render.subprocess.test.ts` (one test, two spawns) and
+`test/history-retention.subprocess.test.ts` (two `describe.each` tests, one
+spawn each) — had the identical latent gap and got the same 30s timeout.
+
+### Result
+
+With the same contention that previously failed 4/6 cases, the file now
+reports **6 passed (6)**. The full suite still reports **115 files passed,
+4,588 passed | 0 skipped | 0 failed**.
