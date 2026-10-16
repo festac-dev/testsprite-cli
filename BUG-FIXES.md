@@ -96,3 +96,23 @@ tests above plus 2 that were already skipped before this change). The six
 tests now skip (rather than fail) in capability-holding environments and
 continue to exercise the permission-denied code paths everywhere the OS can
 actually produce EACCES.
+
+The "runs normally on a standard machine" claim was also verified _in this
+same container_ by removing the bypass capabilities from the test process and
+its children with `setpriv` (dropping `CAP_DAC_OVERRIDE` and
+`CAP_DAC_READ_SEARCH` from the inheritable, ambient, and bounding sets):
+
+```
+$ setpriv --bounding-set=-dac_override,-dac_read_search \
+    --inh-caps=-dac_override,-dac_read_search \
+    --ambient-caps=-dac_override,-dac_read_search npm run test
+
+ Test Files  115 passed (115)
+      Tests  4586 passed | 2 skipped (4588)
+```
+
+With the kernel enforcing mode bits again, the probe flips to `true` and all
+six previously-skipped tests **run and pass** (4,586 = 4,580 + 6; only the 2
+pre-existing skips remain). The identical 115 files pass in both environments,
+so the skip guard is the only behavioral difference and the EACCES mapping is
+exercised for real wherever the OS permits it.
