@@ -116,3 +116,71 @@ six previously-skipped tests **run and pass** (4,586 = 4,580 + 6; only the 2
 pre-existing skips remain). The identical 115 files pass in both environments,
 so the skip guard is the only behavioral difference and the EACCES mapping is
 exercised for real wherever the OS permits it.
+
+## 2026-10-16 (follow-up) — the remaining 8 skipped tests now execute everywhere
+
+### Symptoms
+
+With the failure from above fixed, `npm run test` still reported
+**8 skipped | 0 failed**:
+
+- 6 skips: the chmod-based EACCES-mapping tests above, skipped in any
+  capability-holding environment (verified equivalent only via the manual
+  `setpriv` invocation, not by the default `npm test` path).
+- 2 skips: the two `resolveBundleDir` tests in `src/lib/bundle.test.ts`
+  gated on `it.runIf(process.platform === 'win32')` — "strips a trailing
+  backslash (native Windows path)" and "preserves a bare Windows drive root
+  instead of truncating it to a drive-relative path" — skipped on every
+  non-Windows machine.
+
+### Root causes
+
+1. **Capability-holding processes make mode bits advisory.** The skip guard
+   was the correct _fallback_, but the default `npm test` path did nothing
+   about it: in a container (root) or user-namespace sandbox (non-root uid
+   with the full capability set — this repo's CI sandbox is such an
+   environment), `CAP_DAC_OVERRIDE` stays in the effective set, the probe in
+   `test/helpers/fsModeEnforcement.ts` correctly reports `false`, and 6 real
+   regression tests never execute. The capability can be dropped from the
+   process's own inheritable/ambient/bounding sets via `setpriv` before
+   vitest spawns its workers — no root privilege is needed to drop your own
+   capabilities — but nothing did that automatically.
+2. **The two `resolveBundleDir` tests conflated two concerns.** Their
+   assertions decompose into (a) `stripTrailingSeparators` — pure string
+   logic handling `\` separators and the `C:\` drive-root special case,
+   identical on every platform — and (b) node's platform-native
+   `isAbsolute('C:\\...')` returning `true`, which only holds under an
+   actual win32 runtime. The tests gated _both_ on win32 when only (b) is
+   platform-bound; (a) is exactly the logic that could regress and it ran
+   nowhere outside Windows.
+
+### Fixes
+
+1. **`scripts/run-tests.mjs` (new) + `test` npm script now runs through it.**
+   On Linux, when `CapEff` shows `CAP_DAC_OVERRIDE` (bit 1) — checked
+   directly in `/proc/self/status`, deliberately _not_ gated on the effective
+   uid, since user-namespace sandboxes hold the full set as non-root — the
+   script re-executes vitest under `setpriv`, dropping both capabilities
+   from the bounding/inheritable/ambient sets (the exact invocation is in
+   the script, and verbatim in the section above) so the kernel enforces
+   mode bits again and the probe flips to `true`. On macOS, Windows, plain
+   non-root runners (where the capabilities are never held), or if `setpriv`
+   is missing or fails to exec, it falls back to a plain `vitest run`, so
+   `npm test` never becomes harder to run. CLI args pass through
+   (`npm run test -- <file>`).
+2. **`bundle.test.ts`**: exported `stripTrailingSeparators` from
+   `src/lib/bundle.ts` (pure string logic, no behavior change) and rewrote
+   the two win32-gated tests as always-running assertions against it —
+   trailing-backslash stripping and drive-root preservation now run on every
+   platform. The genuinely win32-bound part (node's `isAbsolute`
+   recognizing `C:\…`) is node's own behavior and is exercised by the
+   Windows CI leg rather than re-asserted on Linux.
+
+### Result
+
+`npm run test` in this previously-skipping environment now reports
+**115 files passed, 4,588 passed | 0 skipped | 0 failed** — every test in the
+suite executes by default, including all 6 EACCES-mapping tests and the 2
+Windows-path tests. The arithmetic checks out: 4,580 (baseline passing) + 2
+(converted bundle tests) + 6 (mode-bit tests now running under dropped
+capabilities) = 4,588.
